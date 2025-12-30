@@ -135,7 +135,7 @@ def find_recommendations(pool, unpaid):
                 best_diff, best_p_idx, best_p_row = candidates[0]
                 
                 # Create recommendation
-                is_perfect = (best_diff <= 1.0)
+                is_perfect = (best_diff <= 5.0) # Relaxed threshold slightly for float diffs
                 reason = "✅ เลขตรง + ยอดตรง (Perfect)" if is_perfect else f"⚠️ เลขตรงแต่ยอดไม่เท่า (Diff {best_p_row['Amount'] - o_row['Amount']:,.2f})"
                 
                 recs.append({
@@ -148,8 +148,14 @@ def find_recommendations(pool, unpaid):
                     'Op_Guest': o_row['Guest Name'], 'Dep_Guest': best_p_row['Guest Name'],
                     'Op_Date': o_row['Checkin_Date'], 'Dep_Date': best_p_row['Checkin_Date']
                 })
-                covered_op.add(o_idx)
-                covered_dep.add(best_p_idx)
+                
+                # CRITICAL CHANGE: Only mark as covered if the match is "Good Enough".
+                # If ID matches but amount is wildly different, we show it as a warning (rec),
+                # BUT we do NOT mark it as covered. This allows other logics (Exact Amount/Name)
+                # to pick up the item if there's a better match available.
+                if is_perfect:
+                    covered_op.add(o_idx)
+                    covered_dep.add(best_p_idx)
 
     # --- 3. Exact Amount Match (Strict 1-to-1) ---
     # Only for items not covered by ID match
@@ -461,10 +467,22 @@ with t2:
                 else:
                     drop_op = []
                     drop_dep = []
+                    
+                    processed_op = set()
+                    processed_dep = set()
+                    
                     for i in range(len(sel)):
                         row_val = sel.iloc[i]
                         o_idx = op_idx_list[i]
                         d_idx = dep_idx_list[i]
+                        
+                        # Prevent processing duplicates if user selects multiple rows for same item
+                        if o_idx in processed_op or d_idx in processed_dep:
+                            continue
+                        
+                        processed_op.add(o_idx)
+                        processed_dep.add(d_idx)
+                        
                         deduct_amt = row_val['Op_Amount'] 
                         
                         log_history(st.session_state.unpaid_opera.loc[[o_idx]], 'Magic Match', 'Opera')
