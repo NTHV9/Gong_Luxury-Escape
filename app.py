@@ -100,37 +100,62 @@ def log_history(df, action_type, source):
     st.session_state.match_history = pd.concat([st.session_state.match_history, new_hist], ignore_index=True)
 
 def find_recommendations(pool, unpaid):
+    # --- 1. Preparation: Force numeric types for calculation ---
+    pool = pool.copy()
+    unpaid = unpaid.copy()
+    pool['Amount'] = pd.to_numeric(pool['Amount'], errors='coerce').fillna(0.0)
+    unpaid['Amount'] = pd.to_numeric(unpaid['Amount'], errors='coerce').fillna(0.0)
+
     recs = []
     pool_map = {} 
+    # Map Booking ID -> List of indices
     for idx, row in pool.iterrows():
         key = clean_id(row['Booking ID'])
         if key: pool_map.setdefault(key, []).append(idx)
 
     covered_op = set(); covered_dep = set()
 
+    # --- 2. ID Match Logic (Scanning) ---
     for o_idx, o_row in unpaid.iterrows():
         v = clean_id(o_row['Voucher'])
         if v and v in pool_map:
+            # Gather all candidates for this Voucher ID
+            candidates = []
             for p_idx in pool_map[v]:
                 if p_idx in covered_dep: continue
                 p_row = pool.loc[p_idx]
-                diff = p_row['Amount'] - o_row['Amount']
-                if abs(diff) > 1.0:
-                    recs.append({
-                        'Select': False,
-                        'Opera_Idx': o_idx, 'Dep_Idx': p_idx,
-                        'Op_Voucher': o_row['Voucher'],      
-                        'Dep_Booking_ID': p_row['Booking ID'], 
-                        'Op_Amount': o_row['Amount'], 'Dep_Amount': p_row['Amount'],
-                        'Reason': f"⚠️ เลขตรง ยอดต่าง {diff:,.2f}", 
-                        'Op_Guest': o_row['Guest Name'], 'Dep_Guest': p_row['Guest Name'],
-                        'Op_Date': o_row['Checkin_Date'], 'Dep_Date': p_row['Checkin_Date']
-                    })
-                    covered_op.add(o_idx); covered_dep.add(p_idx)
-                    break 
+                diff = abs(p_row['Amount'] - o_row['Amount'])
+                candidates.append((diff, p_idx, p_row))
+            
+            if candidates:
+                # Sort candidates by difference (smallest difference first)
+                candidates.sort(key=lambda x: x[0])
+                
+                # Pick the best candidate
+                best_diff, best_p_idx, best_p_row = candidates[0]
+                
+                # Create recommendation
+                is_perfect = (best_diff <= 1.0)
+                reason = "✅ เลขตรง + ยอดตรง (Perfect)" if is_perfect else f"⚠️ เลขตรงแต่ยอดไม่เท่า (Diff {best_p_row['Amount'] - o_row['Amount']:,.2f})"
+                
+                recs.append({
+                    'Select': False,
+                    'Opera_Idx': o_idx, 'Dep_Idx': best_p_idx,
+                    'Op_Voucher': o_row['Voucher'],      
+                    'Dep_Booking_ID': best_p_row['Booking ID'], 
+                    'Op_Amount': o_row['Amount'], 'Dep_Amount': best_p_row['Amount'],
+                    'Reason': reason, 
+                    'Op_Guest': o_row['Guest Name'], 'Dep_Guest': best_p_row['Guest Name'],
+                    'Op_Date': o_row['Checkin_Date'], 'Dep_Date': best_p_row['Checkin_Date']
+                })
+                covered_op.add(o_idx)
+                covered_dep.add(best_p_idx)
 
+    # --- 3. Exact Amount Match (Strict 1-to-1) ---
+    # Only for items not covered by ID match
     pool_amounts = pool[~pool.index.isin(covered_dep) & (pool['Amount'] > 0)].groupby('Amount').indices
     op_amounts = unpaid[~unpaid.index.isin(covered_op) & (unpaid['Amount'] > 0)].groupby('Amount').indices
+    
     for amt, pool_idxs in pool_amounts.items():
         if amt in op_amounts:
             op_idxs = op_amounts[amt]
@@ -139,30 +164,41 @@ def find_recommendations(pool, unpaid):
                 recs.append({
                     'Select': False, 'Opera_Idx': o_idx, 'Dep_Idx': p_idx,
                     'Op_Amount': amt, 'Dep_Amount': amt,
-                    'Reason': '💰 ยอดเงินตรงกันเป๊ะ',
+                    'Reason': '💰 ยอดเงินตรงกันเป๊ะ (No ID)',
                     'Op_Voucher': unpaid.at[o_idx, 'Voucher'], 'Dep_Booking_ID': pool.at[p_idx, 'Booking ID'],
                     'Op_Guest': unpaid.at[o_idx, 'Guest Name'], 'Dep_Guest': pool.at[p_idx, 'Guest Name'],
                     'Op_Date': unpaid.at[o_idx, 'Checkin_Date'], 'Dep_Date': pool.at[p_idx, 'Checkin_Date']
                 })
                 covered_op.add(o_idx); covered_dep.add(p_idx)
     
+    # --- 4. Name Similarity Match ---
     for o_idx, o_row in unpaid.iterrows():
         if o_idx in covered_op: continue
         o_name = str(o_row['Guest Name']).upper()
         o_tokens = set(re.split(r'\s+', re.sub(r'[^A-Z]', ' ', o_name))) - {'MR', 'MRS', 'MS', 'MISS'}
         if not o_tokens: continue
+        
         for p_idx, p_row in pool.iterrows():
             if p_idx in covered_dep: continue
+            
+            # Skip if amount difference is too large (e.g. > 100) to avoid false positives on common names
             if abs(p_row['Amount'] - o_row['Amount']) > 100: continue 
+            
             p_name = str(p_row['Guest Name']).upper()
             p_tokens = set(re.split(r'\s+', re.sub(r'[^A-Z]', ' ', p_name))) - {'MR', 'MRS', 'MS', 'MISS'}
+            
             if len(o_tokens.intersection(p_tokens)) >= 1:
                 date_match = False
                 if o_row['Checkin_Date'] and p_row['Checkin_Date']:
-                    if abs((o_row['Checkin_Date'] - p_row['Checkin_Date']).days) <= 3: date_match = True
+                    try:
+                        # Ensure dates are comparable
+                        if abs((o_row['Checkin_Date'] - p_row['Checkin_Date']).days) <= 3: date_match = True
+                    except: pass
+                
                 reason = ""
                 if date_match: reason = "📅 ชื่อคล้าย + วันใกล้กัน"
                 elif abs(p_row['Amount'] - o_row['Amount']) < 1.0: reason = "💰 ชื่อคล้าย + ยอดตรง"
+                
                 if reason:
                     recs.append({
                         'Select': False, 'Opera_Idx': o_idx, 'Dep_Idx': p_idx,
@@ -405,7 +441,8 @@ with t2:
             column_config={
                 "Select": st.column_config.CheckboxColumn("เลือก", default=False),
                 "Op_Amount": st.column_config.NumberColumn("ยอด Opera", format="%.2f"),
-                "Dep_Amount": st.column_config.NumberColumn("ยอด Deposit", format="%.2f")
+                "Dep_Amount": st.column_config.NumberColumn("ยอด Deposit", format="%.2f"),
+                "Reason": st.column_config.TextColumn("สาเหตุ", width="medium"),
             },
             use_container_width=True, hide_index=True, key="recs_editor"
         )
