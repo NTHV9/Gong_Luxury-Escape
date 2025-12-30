@@ -159,12 +159,18 @@ def find_recommendations(pool, unpaid):
 
     # --- 3. Exact Amount Match (Strict 1-to-1) ---
     # Only for items not covered by ID match
-    pool_amounts = pool[~pool.index.isin(covered_dep) & (pool['Amount'] > 0)].groupby('Amount').indices
-    op_amounts = unpaid[~unpaid.index.isin(covered_op) & (unpaid['Amount'] > 0)].groupby('Amount').indices
     
-    for amt, pool_idxs in pool_amounts.items():
-        if amt in op_amounts:
-            op_idxs = op_amounts[amt]
+    # FIX: Use .groups to get Index Labels instead of .indices (which gives integer positions)
+    # This prevents "off-by-one" or wrong row selection when rows are filtered/deleted.
+    pool_subset = pool[~pool.index.isin(covered_dep) & (pool['Amount'] > 0)]
+    op_subset = unpaid[~unpaid.index.isin(covered_op) & (unpaid['Amount'] > 0)]
+
+    pool_groups = pool_subset.groupby('Amount').groups
+    op_groups = op_subset.groupby('Amount').groups
+    
+    for amt, pool_idxs in pool_groups.items():
+        if amt in op_groups:
+            op_idxs = op_groups[amt]
             if len(pool_idxs) == 1 and len(op_idxs) == 1:
                 p_idx = pool_idxs[0]; o_idx = op_idxs[0]
                 recs.append({
